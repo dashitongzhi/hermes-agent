@@ -7750,20 +7750,14 @@ class GatewayRunner:
         return output or "(no output)"
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
-        """Handle /status command."""
+        """Handle /status command — render the full agent status panel."""
+        from tools.agent_status_panel import collect_status, format_status_panel
+
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
-
-        connected_platforms = [p.value for p in self.adapters.keys()]
-
-        # Check if there's an active agent
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
 
-        # Count pending /queue follow-ups (slot + overflow).
-        adapter = self.adapters.get(source.platform) if source else None
-        queue_depth = self._queue_depth(session_key, adapter=adapter)
-
+        # Gather title from session DB
         title = None
         # Pull token totals from the SQLite session DB rather than the
         # in-memory SessionStore.  The agent's per-turn token deltas are
@@ -7790,27 +7784,29 @@ class GatewayRunner:
             except Exception:
                 db_total_tokens = 0
 
-        lines = [
-            "📊 **Hermes Gateway Status**",
-            "",
-            f"**Session ID:** `{session_entry.session_id}`",
-        ]
-        if title:
-            lines.append(f"**Title:** {title}")
-        lines.extend([
-            f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Tokens:** {db_total_tokens:,}",
-            f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
-        ])
-        if queue_depth:
-            lines.append(f"**Queued follow-ups:** {queue_depth}")
-        lines.extend([
-            "",
-            f"**Connected Platforms:** {', '.join(connected_platforms)}",
-        ])
+        data = collect_status(
+            session_db=self._session_db,
+            gateway=self,
+            session_id=session_entry.session_id,
+            title=title or "",
+        )
 
-        return "\n".join(lines)
+        # Append gateway-specific context: queue depth and platforms
+        adapter = self.adapters.get(source.platform) if source else None
+        queue_depth = self._queue_depth(session_key, adapter=adapter)
+        connected_platforms = [p.value for p in self.adapters.keys()]
+
+        panel = format_status_panel(data)
+
+        # Append gateway extras
+        extras: list[str] = []
+        if queue_depth:
+            extras.append(f"📬 Queued follow-ups: {queue_depth}")
+        extras.append(f"🌐 Platforms: {', '.join(connected_platforms)}")
+        if extras:
+            panel += "\n" + "\n".join(extras)
+
+        return panel
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
