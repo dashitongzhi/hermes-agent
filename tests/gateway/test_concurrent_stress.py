@@ -9,6 +9,7 @@ Simulates real-world scenarios:
 """
 
 import asyncio
+import concurrent.futures
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -77,9 +78,12 @@ def _make_runner(max_concurrent=3):
     runner.session_store = MagicMock()
     runner.delivery_router = MagicMock()
     runner._concurrent_tasks = {}
+    runner._concurrent_tasks_ts = {}
     runner._concurrent_counter = 0
+    runner._concurrent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent)
     runner._busy_input_mode = "concurrent"
     runner._busy_ack_ts = {}
+    runner._ephemeral_system_prompt = ""
     runner._max_concurrent_tasks = max_concurrent
     return runner, adapter
 

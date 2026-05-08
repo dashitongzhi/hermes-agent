@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import inspect
 import json
@@ -1109,7 +1110,12 @@ class GatewayRunner:
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._concurrent_tasks: Dict[str, List[asyncio.Task]] = {}  # session_key -> [asyncio.Task, ...]
+        self._concurrent_tasks_ts: Dict[str, Dict[str, float]] = {}  # session_key -> {task_id: start_time}
         self._concurrent_counter: int = 0  # monotonic counter for task IDs
+        self._concurrent_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(os.getenv("HERMES_MAX_CONCURRENT_TASKS", "3")),
+            thread_name_prefix="concurrent",
+        )
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         # Overflow buffer for explicit /queue commands.  The adapter-level
         # _pending_messages dict is a single slot per session (designed for
@@ -2343,17 +2349,21 @@ class GatewayRunner:
                 return True
 
             self._concurrent_counter += 1
-            task_id = f"concurrent-{self._concurrent_counter}" 
+            task_id = f"concurrent-{self._concurrent_counter}"
             logger.info(
                 "[%s] Concurrent mode: spawning %s for session %s",
                 adapter.name, task_id, session_key,
             )
+            # Record start time for status reporting
+            self._concurrent_tasks_ts.setdefault(session_key, {})[task_id] = time.time()
+
             task = asyncio.create_task(
                 self._run_concurrent_agent(event, session_key, task_id)
             )
+            task.set_name(task_id)
             self._concurrent_tasks.setdefault(session_key, []).append(task)
             task.add_done_callback(
-                lambda t, sk=session_key: self._on_concurrent_done(t, sk)
+                lambda t, sk=session_key, tid=task_id: self._on_concurrent_done(t, sk, tid)
             )
 
             # Debounced acknowledgment
@@ -2552,6 +2562,10 @@ class GatewayRunner:
             user_config = _load_gateway_config()
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
+            # Build ephemeral system prompt so concurrent agents get
+            # user-configured system_prompt, channel context, etc.
+            combined_ephemeral = self._ephemeral_system_prompt or ""
+
             agent = AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
@@ -2561,14 +2575,20 @@ class GatewayRunner:
                 enabled_toolsets=enabled_toolsets,
                 skip_memory=True,
                 quiet_mode=True,
+                ephemeral_system_prompt=combined_ephemeral or None,
             )
 
-            # Run in executor (AIAgent.run_conversation is sync)
+            # Run in dedicated executor (AIAgent.run_conversation is sync).
+            # Using _concurrent_executor instead of None (default pool) to
+            # isolate concurrent tasks from the main event-loop thread pool.
+            # This is safe in asyncio's single-threaded model — the executor
+            # only runs blocking I/O, and all shared state (_concurrent_tasks,
+            # _busy_ack_ts) is only mutated on the event loop thread.
             loop = asyncio.get_running_loop()
             logger.info("[%s] %s: starting agent for %r", adapter.name, task_id, (event.text or "")[:60])
 
             result = await loop.run_in_executor(
-                None,
+                self._concurrent_executor,
                 lambda: agent.run_conversation(
                     user_message=event.text or "",
                 ),
@@ -2631,18 +2651,23 @@ class GatewayRunner:
             except Exception:
                 pass
 
-    def _on_concurrent_done(self, task: asyncio.Task, session_key: str) -> None:
+    def _on_concurrent_done(self, task: asyncio.Task, session_key: str, task_id: str = "") -> None:
         """Cleanup callback when a concurrent task finishes."""
         tasks = self._concurrent_tasks.get(session_key, [])
         if task in tasks:
             tasks.remove(task)
         if not tasks:
             self._concurrent_tasks.pop(session_key, None)
+        # Clean up timestamp tracking
+        if task_id and session_key in self._concurrent_tasks_ts:
+            self._concurrent_tasks_ts[session_key].pop(task_id, None)
+            if not self._concurrent_tasks_ts[session_key]:
+                self._concurrent_tasks_ts.pop(session_key, None)
         if task.cancelled():
             return
         exc = task.exception()
         if exc:
-            logger.warning("Concurrent task for %s raised: %s", session_key, exc)
+            logger.warning("Concurrent task %s for %s raised: %s", task_id, session_key, exc)
 
     def cancel_concurrent_tasks(self, session_key: str) -> int:
         """Cancel all concurrent tasks for a given session. Returns count cancelled."""
@@ -2704,13 +2729,24 @@ class GatewayRunner:
 
     def get_concurrent_task_info(self) -> Dict[str, Any]:
         """Return info about active concurrent tasks for status display."""
+        now = time.time()
         info: Dict[str, Any] = {}
         for session_key, tasks in self._concurrent_tasks.items():
             active = [t for t in tasks if not t.done()]
             if active:
+                ts_map = self._concurrent_tasks_ts.get(session_key, {})
+                task_details = []
+                for t in active:
+                    tid = t.get_name()
+                    started = ts_map.get(tid, 0)
+                    elapsed = round(now - started, 1) if started else None
+                    task_details.append({
+                        "task_id": tid,
+                        "elapsed_seconds": elapsed,
+                    })
                 info[session_key] = {
                     "count": len(active),
-                    "names": [t.get_name() for t in active],
+                    "tasks": task_details,
                 }
         return info
 

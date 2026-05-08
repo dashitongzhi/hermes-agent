@@ -12,7 +12,9 @@ Covers:
 """
 
 import asyncio
+import concurrent.futures
 import os
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -80,9 +82,12 @@ def _make_runner(max_concurrent=3):
 
     # Concurrent mode fields
     runner._concurrent_tasks = {}
+    runner._concurrent_tasks_ts = {}
     runner._concurrent_counter = 0
+    runner._concurrent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent)
     runner._busy_input_mode = "concurrent"
     runner._busy_ack_ts = {}
+    runner._ephemeral_system_prompt = ""
     runner._max_concurrent_tasks = max_concurrent
 
     return runner, adapter
@@ -329,19 +334,26 @@ async def test_on_concurrent_done_exception_logged():
 
 @pytest.mark.asyncio
 async def test_get_concurrent_task_info():
-    """get_concurrent_task_info should report active tasks per session."""
+    """get_concurrent_task_info should report active tasks with timestamps."""
     runner, _ = _make_runner()
 
     async def long_task():
         await asyncio.sleep(100)
 
     tasks_a = [asyncio.create_task(long_task()) for _ in range(2)]
+    tasks_a[0].set_name("concurrent-1")
+    tasks_a[1].set_name("concurrent-2")
     tasks_b = [asyncio.create_task(long_task()) for _ in range(1)]
+    tasks_b[0].set_name("concurrent-3")
     runner._concurrent_tasks["session-a"] = tasks_a
     runner._concurrent_tasks["session-b"] = tasks_b
+    runner._concurrent_tasks_ts["session-a"] = {"concurrent-1": time.time(), "concurrent-2": time.time()}
+    runner._concurrent_tasks_ts["session-b"] = {"concurrent-3": time.time()}
 
     info = runner.get_concurrent_task_info()
     assert info["session-a"]["count"] == 2
+    assert len(info["session-a"]["tasks"]) == 2
+    assert all("task_id" in t and "elapsed_seconds" in t for t in info["session-a"]["tasks"])
     assert info["session-b"]["count"] == 1
 
     # Cleanup
